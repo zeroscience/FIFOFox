@@ -386,4 +386,4 @@ fifofox squat cowork-vm-service --authorized --impersonate
 
 ## 12. Powered by
 
-Silly Security Inc. - (https://sillysec.com){:target="_blank"}
+Silly Security Inc. - https://sillysec.com
