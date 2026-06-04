@@ -98,7 +98,7 @@ print a one-line color legend at the end.
 
 ## 4. Commands in detail
 
-### 4.1 <span style="color:yellow">enum</span> - grade every pipe on the box
+### 4.1 `enum` - grade every pipe on the box
 
 Walks `\\.\pipe\*`, reads each pipe's security descriptor, converts it to SDDL,
 and grades the DACL (see 5.). By default prints only **flagged** pipes
@@ -152,7 +152,7 @@ if the name is not currently open** (`open` failed). This is the *most useful*
 case: testing whether a name belonging to a **stopped/not-yet-started service**
 can be pre-created and squatted before the legitimate server claims it.
 
-### 4.3 <span style="color:yellow">capture</span> - instance-interception relay (MITM)
+### 4.3 `capture` - instance-interception relay (MITM)
 
 Creates a **competing instance** of the target pipe name, waits for a client to
 land on it, dials the real server, and relays bytes both ways, logging every
@@ -175,7 +175,7 @@ Interception is **opportunistic**: you only catch clients the SCM dispatches to
 *your* instance. Use `--count >1` and trigger reconnects (e.g. restart the
 client app) to gather traffic. **Intrusive and EDR-visible.**
 
-### 4.4 <span style="color:yellow">fuzz</span> - frame fuzzer with crash detection
+### 4.4 `fuzz` - frame fuzzer with crash detection
 
 Connects as a client and sends mutated frames, reading responses non-blocking,
 and detects when the pipe disappears (probable server crash), dumping a repro.
@@ -216,7 +216,7 @@ fifofox fuzz cowork-vm-service --authorized --corpus fifofox_corpus_123.bin --se
 (`WaitNamedPipe`). If it vanishes (`ERROR_FILE_NOT_FOUND`), the offending wire
 bytes are written to `crash_<ts>_<iter>.bin` and the run stops.
 
-### 4.5 <span style="color:yellow">squat</span> - squat + impersonation PoC (dual-use, gated)
+### 4.5 `squat` - squat + impersonation PoC (dual-use, gated)
 
 Claims the pipe name with `FILE_FLAG_FIRST_PIPE_INSTANCE`, waits for a client,
 and (optionally) impersonates it to show the squat→impersonation risk.
