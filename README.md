@@ -120,7 +120,7 @@ fifofox enum --all --html report.html :: full report to console + HTML
 > pipe to read its SD. On some servers this registers as a connection. It is
 > read-only and momentary, but be aware of it on sensitive hosts.
 
-### 4.2 <span style="color:yellow">audit</span> - deep single-pipe report
+### 4.2 `audit` - deep single-pipe report
 
 Full report for one pipe: `GetNamedPipeInfo` geometry (type, buffer sizes, max
 instances), server + client PID and image path, SDDL, ACE-by-ACE grade, and a
