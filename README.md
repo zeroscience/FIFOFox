@@ -4,7 +4,7 @@
   ____ _ ____ ____ ____ ____ _  _
   |___ | |___ |  | |___ |  |  \/ 
   |    | |    |__| |    |__| _/\_
-  FIFOFox v1.2.3 (ilegnisi)  - Windows named-pipe security auditor & fuzzer
+  FIFOFox v1.2.3 (ilegnisi)  - Windows named-pipe security auditor and fuzzer
 ```
 
 **Windows named-pipe security auditor + fuzzer.**
