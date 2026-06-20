@@ -59,7 +59,8 @@ visibility; a service context is needed only to *weaponize* impersonation.
 | Mode | What it does |
 |---|---|
 | `enum` | Enumerate and **grade** every pipe's DACL; optional HTML report. |
-| `audit` | Deep single-pipe report: SDDL, geometry, PIDs, live squattability test. |
+| `listeners` | Enumerate **loopback/wildcard TCP IPC** endpoints + owner/privilege (the other half of local IPC). |
+| `audit` | Deep single-pipe report: SDDL, geometry, PIDs, squattability, owning-service escalation surface + **trust-predicate linter**. |
 | `capture` | Interception **relay** (MITM); logs both directions + writes a fuzz corpus. |
 | `fuzz` | Frame **fuzzer** with crash detection; structure-aware with a corpus. |
 | `squat` | Claim/relay a pipe name; optional `--impersonate` (gated). |
@@ -115,6 +116,7 @@ and any SDs you couldn't read.
 
 ```
 fifofox enum    [--all] [--squat] [--html <file>]
+fifofox listeners [--all]                          (loopback TCP IPC endpoints + owner)
 fifofox audit   <pipe> [--html <file>]
 fifofox capture <pipe> --authorized [--count N]
 fifofox fuzz    <pipe> --authorized [options]
@@ -173,6 +175,34 @@ fifofox enum --all --html report.html :: full report to console + HTML
 > to read its SD. On some servers this registers as a momentary connection. It is
 > read-only, but be aware of it on sensitive hosts.
 
+### 4.1b `listeners` - loopback TCP IPC endpoints
+
+Named pipes are one local-IPC transport; **loopback TCP** is the other half (auto-updaters,
+agents, "Elevator" helpers). Lists every `127.0.0.1`/`::1` (and wildcard `0.0.0.0`/`::`)
+**TCP listener** with its owning process and **account/privilege** - because *any* local
+user can connect to a loopback listener (TCP has no DACL), so the risk is the **owner's
+privilege**. A **SYSTEM-owned loopback listener is the auto-updater IPC attack surface**.
+
+| Option | Meaning |
+|---|---|
+| (none) | loopback + wildcard listeners only |
+| `--all` | include listeners on every interface |
+
+Owners are resolved via the **service account** first (so SYSTEM services resolve even
+when `OpenProcess` is denied), else the process token. Grading: **DANGER** = SYSTEM/
+LocalSystem owner; **WARN** = LocalService/NetworkService; **ok** = normal user.
+
+```
+fifofox listeners            :: loopback/wildcard endpoints + owner
+fifofox listeners --all      :: every interface
+```
+```
+[DANGER] 127.0.0.1:4767   (loopback)   PID 5092  PanGPS.exe       owner: LocalSystem [svc:PanGPS]
+[  ok  ] 127.0.0.1:19010  (loopback)   PID 4270  logioptionsplus_agent.exe  owner: LAB17\you
+```
+Then probe an interesting one's protocol with a client / `decode` (it speaks JSON, protobuf,
+DCE/RPC, …). TCP listeners have no HTML report yet.
+
 ### 4.2 `audit` - deep single-pipe report
 
 Full report for one pipe: `GetNamedPipeInfo` geometry (type, buffer sizes, max
@@ -183,6 +213,7 @@ higher-IL than you), SDDL, ACE-by-ACE grade, and a **live squattability test**.
 | Option | Meaning |
 |---|---|
 | `--html <file>` | Write a single-row HTML report including geometry + squattability. |
+| `--peek` | Passively read any unsolicited server greeting and auto-detect its format (protobuf/DCE-RPC/.NET/JSON/…). Request/response servers that volunteer nothing are reported as such. Opt-in (it connects + reads). |
 
 ```bat
 fifofox audit cowork-vm-service
@@ -209,6 +240,12 @@ endpoint. Disable with `--no-service`:
 - **Binary directory / file** - whether a low-priv SID can plant a side-load DLL in
   the service's program directory or replace the executable; **DANGER** when the
   service is privileged, **WARN** (cross-user code-integrity) otherwise.
+- **Trust-predicate linter** (heuristic, static) - greps the service binary (ASCII +
+  UTF-16) for the recurring auto-updater weaknesses: `CryptQueryObject`/cert-chain APIs
+  **without** `WinVerifyTrust` (CWE-347, signature existence != validity), hardcoded
+  `CN=` signer strings (substring-match risk), a temp path + `CreateProcessAsUser`
+  (copy->verify->exec TOCTOU), and toggleable `*signature*`/`check_msi_digest` config
+  flags. Notes only - it flags leads to confirm, it does not change the verdict grade.
 
 ```text
   --- owning service / escalation surface ---
@@ -271,7 +308,10 @@ fifofox fuzz cowork-vm-service --authorized --frame len32le --iters 2000
 fifofox fuzz cowork-vm-service --authorized --corpus fifofox_corpus_123.bin --seed 0xC0FFEE -v
 ```
 
-Strategies are cycled (corpus-havoc dominates when a corpus is loaded): `random`,
+With a corpus, mutation is **format-aware**: recognised frames (kiros/protobuf, DCE/RPC)
+are kept structurally valid and only their inner fields/stub are fuzzed, so the target
+parses past the framing into the handler; the rest of the time, byte-level strategies are
+cycled (corpus-havoc dominates when a corpus is loaded): `random`,
 `long-A` overflow walls, `format-string`, `path-traversal`, **`length-lie`** (tiny
 body, declared length `0x7FFFFFFF`), `0x00/0xFF` boundaries, `zero/short`, and
 `corpus-havoc` (bit-flips/truncation/padding of real frames). On a crash
@@ -335,22 +375,25 @@ hex only.
 ### 4.7 `decode` - offline protocol dissector
 
 Turns captured bytes into a readable field tree **without connecting to anything** -
-the same decoder `send` and `capture` apply inline. It auto-detects framing and walks
-the protobuf wire format:
+the same decoder `send` and `capture` apply inline. Protobuf is just one format; IPC
+payloads come in many, so `decode` **auto-detects the payload format** and routes to
+the matching dissector:
 
-- the `u32be(8)["protobuf"] u32be(len) [body]` magic frame,
-- an **outer `u32le`/`u32be` length prefix** wrapping such a frame (server replies),
-- a bare length-prefixed protobuf, or raw protobuf,
-
-printing each field as `fN: varint / i32 / i64 / str / bytes / msg`, recursing into
-nested messages and `google.protobuf.Any` (`type_url` + value). Non-protobuf falls
-back to a hex+ASCII dump.
+| Detected format | What it shows |
+|---|---|
+| **protobuf / kiros** | the `u32be(8)["protobuf"]` magic frame (incl. an outer `u32le/u32be` length wrapper), bare length-prefixed and raw protobuf; field tree (`varint/i32/i64/str/bytes/msg`) recursing into nested messages and `google.protobuf.Any`. |
+| **DCE/RPC (MSRPC)** | PDU header (version, packet type, endianness, frag length, call id) + the **bound interface UUID** (resolved to `lsarpc`/`samr`/`svcctl`/`spoolss`/`efsrpc`/…) and the **request opnum**. |
+| **.NET serialization** | BinaryFormatter / NetDataContractSerializer / NMF streams, **flagged as an unsafe-deserialization candidate** (feed to `ysoserial.net`). |
+| **JSON / XML / text** | pretty-printed as text. |
+| **ASN.1 / DER** | TLV skeleton (SEQUENCE/SET/INTEGER/OID/…) walk. |
+| **binary** | hex+ASCII fallback. |
 
 | Option | Meaning |
 |---|---|
 | `<file>` | A single captured frame. |
 | `--corpus` | Treat `<file>` as a `capture` corpus (`[u32le len][frame]` records) and dissect each. |
 | `--hex <bytes>` | Dissect an inline hex string instead of a file (whitespace/punctuation ignored). |
+| `--format <f>` | Force the dissector (`auto`/`protobuf`/`dcerpc`/`dotnet`/`json`/`xml`/`asn1`/`text`/`hex`) when auto-detect guesses wrong. |
 
 ```bat
 fifofox decode trigger.bin
@@ -536,6 +579,26 @@ fifofox squat some-service --authorized --impersonate
 
 **v1.2.3 (ilegnisi)** - current
 
+- **New `listeners` mode - loopback TCP IPC surface.** Enumerates `127.0.0.1`/`::1`
+  (and wildcard) TCP listeners with owning process + **account/privilege**, flagging
+  **SYSTEM-owned loopback listeners** (the auto-updater/agent attack surface). Owner is
+  resolved via the service account, so SYSTEM services resolve even when `OpenProcess`
+  is denied. Extends FIFOFox from a named-pipe tool toward a **local-IPC** tool.
+- **Trust-predicate linter in `audit`.** Static heuristics on the owning service binary
+  for the classic updater signature-verification weaknesses (`CryptQueryObject` without
+  `WinVerifyTrust` = CWE-347, `CN=` substring signer checks, temp+`CreateProcessAsUser`
+  TOCTOU, toggleable signature config flags). Reports leads; doesn't change the grade.
+- **Multi-format payload dissection.** `decode`/`send`/`capture` now **auto-detect the
+  payload format** instead of assuming protobuf: protobuf/kiros, **DCE/RPC** (header +
+  bound interface UUID + opnum), **.NET serialization** (flagged as an unsafe-
+  deserialization candidate), JSON, XML, ASN.1/DER, text, or hex. `--format <f>` forces it.
+- **Format-aware fuzzing.** `fuzz --corpus` now keeps recognised frames **structurally
+  valid** while mutating the inner content (protobuf field values incl. boundary varints
+  and overflow strings; DCE/RPC stub with a fixed-up frag length), so the target parses
+  *past* the framing into the handler instead of bouncing off the length check.
+- **`audit --peek`.** Optional passive read of any unsolicited server greeting, then
+  format auto-detect - tells you what protocol a pipe speaks without a full capture
+  (request/response servers that volunteer nothing are reported as such).
 - **Clickable severity filter in the HTML report.** The Danger/Warn/OK summary cards
   are now clickable and filter the table to that severity (Pipes = show all), pure
   CSS, no JavaScript, still one self-contained file.
