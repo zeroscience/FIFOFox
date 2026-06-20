@@ -43,16 +43,17 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 
-#include <windows.h>//
-#include <stdlib.h>///
-#include <string.h>///
-#include <stdint.h>///
-#include <aclapi.h>///
-#include <winsvc.h>///
-#include <stdarg.h>///
-#include <stdio.h>////
-#include <sddl.h>/////
-#include <time.h>/////
+#include <tlhelp32.h>//
+#include <windows.h>///
+#include <stdlib.h>////
+#include <string.h>////
+#include <stdint.h>////
+#include <aclapi.h>////
+#include <winsvc.h>////
+#include <stdarg.h>////
+#include <stdio.h>/////
+#include <sddl.h>//////
+#include <time.h>//////
 
 #define FIFOFOX_VERSION "1.2.3 (ilegnisi)"
 
@@ -75,6 +76,8 @@ static int g_verbose = 0;
 static int g_debug   = 0;
 static int g_decode  = 1;
 static int g_no_service = 0;
+static int g_peek = 0;
+static void dissect_auto(FILE *f, const unsigned char *b, size_t n);
 
 static void vrb(const char *fmt, ...)
 {
@@ -878,6 +881,54 @@ static int acct_privileged(const char *a)
             !_stricmp(a, "NT AUTHORITY\\System") || !_stricmp(a, "NT Authority\\LocalSystem"));
 }
 
+static int mem_has(const unsigned char *h, size_t hn, const char *n)
+{
+    size_t nl = strlen(n), i;
+    if (nl == 0 || nl > hn) return 0;
+    for (i = 0; i + nl <= hn; ++i) if (h[i] == (unsigned char)n[0] && memcmp(h + i, n, nl) == 0) return 1;
+    return 0;
+}
+static int bin_has(const unsigned char *h, size_t hn, const char *n)
+{
+    size_t nl = strlen(n), i, j;
+    if (mem_has(h, hn, n)) return 1;
+    if (nl == 0 || nl * 2 > hn) return 0;
+    for (i = 0; i + nl * 2 <= hn; ++i) { int ok = 1;
+        for (j = 0; j < nl; ++j) if (h[i + j * 2] != (unsigned char)n[j] || h[i + j * 2 + 1] != 0) { ok = 0; break; }
+        if (ok) return 1; }
+    return 0;
+}
+static int lint_trust(const char *exe, char *out, size_t cap)
+{
+    FILE *f; long sz; size_t got; unsigned char *b; int sev = 0, wvt, cqo, chain, cps, cn, temp, k;
+    static const char *flags[] = { "check_msi_digest", "skip_signature", "skipSignature", "SkipSignature",
+        "disable_signature", "verifySignature", "check_signature", "NoSignatureCheck", "AllowUnsigned", NULL };
+    if (!exe || !exe[0]) return 0;
+    f = fopen(exe, "rb"); if (!f) return 0;
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (64L << 20)) { fclose(f); return 0; }
+    b = (unsigned char *)malloc((size_t)sz); if (!b) { fclose(f); return 0; }
+    got = fread(b, 1, (size_t)sz, f); fclose(f);
+    wvt   = mem_has(b, got, "WinVerifyTrust");
+    cqo   = mem_has(b, got, "CryptQueryObject");
+    chain = mem_has(b, got, "CertGetCertificateChain") || mem_has(b, got, "CertVerifyCertificateChainPolicy");
+    cps   = mem_has(b, got, "CreateProcessAsUser");
+    cn    = bin_has(b, got, "CN=");
+    temp  = bin_has(b, got, "\\Temp\\") || mem_has(b, got, "GetTempPath");
+    appendf(out, cap, "    sig APIs: WinVerifyTrust=%s CryptQueryObject=%s CertChain=%s\n",
+            wvt ? "yes" : "no", cqo ? "yes" : "no", chain ? "yes" : "no");
+    if (!wvt && (cqo || chain)) { appendf(out, cap,
+        "    [WARN] parses a signature but NOT via WinVerifyTrust -> may check existence, not trust (CWE-347)\n"); if (sev < 1) sev = 1; }
+    if (!wvt && !cqo && !chain)
+        appendf(out, cap, "    [note] no signature-verification API found in the binary\n");
+    if (cn)        appendf(out, cap, "    [note] hardcoded \"CN=\" present -> verify signer match is exact, not substring\n");
+    if (temp && cps) appendf(out, cap, "    [note] temp path + CreateProcessAsUser -> check for copy->verify->exec TOCTOU\n");
+    for (k = 0; flags[k]; ++k) if (bin_has(b, got, flags[k]))
+        appendf(out, cap, "    [note] config flag \"%s\" present -> signature check may be toggleable\n", flags[k]);
+    free(b);
+    return sev;
+}
+
 static int audit_service_surface(DWORD spid, const char *pidimg, char *html, size_t hcap)
 {
     char svc[256] = "", disp[256] = "", image[1024] = "", acct[256] = "";
@@ -945,6 +996,16 @@ static int audit_service_surface(DWORD spid, const char *pidimg, char *html, siz
                       appendf(find, sizeof find, "    binary file low-priv writable: %s  (replace the executable)\n", who2);
                       if (privileged) sev = 2; else if (sev < 1) sev = 1; }
         else printf("  %-12s  [%s] : not low-priv writable\n", "binary file", exe);
+    }
+
+    {
+        char lint[1600] = "";
+        lint_trust(exe, lint, sizeof lint);
+        if (lint[0]) {
+            printf("  %strust checks (heuristic):%s\n", CC(A_GRY), CC(A_RESET));
+            fputs(lint, stdout);
+            if (html) { appendf(html, hcap, "trust-checks:\n%s", lint); }
+        }
     }
 
     {
@@ -1096,6 +1157,33 @@ static int mode_audit(const char *name, const char *htmlpath)
     if (!g_no_service)
         svc_sev = audit_service_surface(spid, simg, svc_html, sizeof svc_html);
 
+    if (g_peek) {
+        HANDLE ph;
+        printf("\n  %s--- passive peek (payload format) ---%s\n", CC(A_GRY), CC(A_RESET));
+        ph = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         NULL, OPEN_EXISTING, 0, NULL);
+        if (ph == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY && WaitNamedPipeA(path, 500))
+            ph = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             NULL, OPEN_EXISTING, 0, NULL);
+        if (ph == INVALID_HANDLE_VALUE) {
+            printf("  (could not open for read: err %lu)\n", (unsigned long)GetLastError());
+        } else {
+            static unsigned char pbuf[16384];
+            DWORD avail = 0, rd = 0, waited = 0;
+            while (waited < 1500) {
+                if (PeekNamedPipe(ph, NULL, 0, NULL, &avail, NULL) && avail) {
+                    ReadFile(ph, pbuf, avail > sizeof pbuf ? (DWORD)sizeof pbuf : avail, &rd, NULL);
+                    break;
+                }
+                Sleep(100); waited += 100;
+            }
+            if (rd > 0) { printf("  server greeted with %lu unsolicited byte(s):\n", (unsigned long)rd);
+                          dissect_auto(stdout, pbuf, rd); }
+            else printf("  server sent no unsolicited data (request/response server) - use 'capture' or 'send' to elicit + classify its protocol\n");
+            CloseHandle(ph);
+        }
+    }
+
     printf("\n");
     print_legend();
 
@@ -1187,6 +1275,108 @@ static enum frame_kind parse_frame(const char *s)
     return FR_RAW;
 }
 
+static int mv_rdvar(const unsigned char *b, size_t n, size_t *i, uint64_t *out)
+{
+    int s = 0; uint64_t x = 0; size_t j = *i, start = *i;
+    while (j < n && j - start < 10) { unsigned char c = b[j++]; x |= (uint64_t)(c & 0x7f) << s;
+        if (!(c & 0x80)) { *out = x; *i = j; return 1; } s += 7; }
+    return 0;
+}
+static void mv_wrvar(unsigned char *o, size_t *p, size_t cap, uint64_t v)
+{ do { unsigned char c = (unsigned char)(v & 0x7f); v >>= 7; if (v) c |= 0x80; if (*p < cap) o[*p] = c; (*p)++; } while (v); }
+static void mv_wr(unsigned char *o, size_t *p, size_t cap, const unsigned char *s, size_t n)
+{ size_t k; for (k = 0; k < n; ++k) { if (*p < cap) o[*p] = s[k]; (*p)++; } }
+
+static size_t mv_fuzz(unsigned char *out, size_t cap)
+{
+    unsigned i, n;
+    switch (rng_u(6)) {
+    case 0:  n = 16 + rng_u(4080); if (n > cap) n = (unsigned)cap; memset(out, 'A', n); return n;
+    case 1:  { static const char *t = "%n%s%x%p%n%n%s"; n = 32 + rng_u(96); if (n > cap) n = (unsigned)cap;
+               for (i = 0; i < n; ++i) out[i] = (unsigned char)t[i % 13]; return n; }
+    case 2:  { static const char *t = "..\\..\\..\\..\\..\\windows\\win.ini"; size_t l = strlen(t);
+               if (l > cap) l = cap; memcpy(out, t, l); return l; }
+    case 3:  n = (unsigned)(cap < 65000 ? cap : 65000); memset(out, 0x41, n); return n;
+    case 4:  return 0;
+    default: n = 1 + rng_u(64); if (n > cap) n = (unsigned)cap; for (i = 0; i < n; ++i) out[i] = (unsigned char)rng_u(256); return n;
+    }
+}
+
+static size_t pb_mutate_frame(const unsigned char *in, size_t inlen, unsigned char *out, size_t cap)
+{
+    static unsigned char env[1 << 17], fz[70000];
+    const unsigned char *pl; size_t pn, i, eo = 0; int kiros = 0, nf = 0, pick, fi = 0;
+    uint64_t k, l, v;
+    if (inlen >= 16 && in[0] == 0 && in[1] == 0 && in[2] == 0 && in[3] == 8 && memcmp(in + 4, "protobuf", 8) == 0) {
+        uint32_t p = ((uint32_t)in[12] << 24) | ((uint32_t)in[13] << 16) | ((uint32_t)in[14] << 8) | in[15];
+        if ((size_t)16 + p > inlen) return 0; pl = in + 16; pn = p; kiros = 1;
+    } else { pl = in; pn = inlen; }
+    i = 0;
+    while (i < pn) {
+        if (!mv_rdvar(pl, pn, &i, &k)) break;
+        if ((k & 7) == 0) { if (!mv_rdvar(pl, pn, &i, &v)) break; }
+        else if ((k & 7) == 2) { if (!mv_rdvar(pl, pn, &i, &l)) break; if (i + l > pn) break; i += (size_t)l; }
+        else if ((k & 7) == 5) i += 4; else if ((k & 7) == 1) i += 8; else break;
+        nf++;
+    }
+    if (nf == 0) return 0;
+    pick = (int)rng_u((unsigned)nf);
+    i = 0;
+    while (i < pn) {
+        if (!mv_rdvar(pl, pn, &i, &k)) break;
+        if ((k & 7) == 0) {
+            if (!mv_rdvar(pl, pn, &i, &v)) break;
+            mv_wrvar(env, &eo, sizeof env, k);
+            if (fi == pick) { uint64_t nv; switch (rng_u(4)) { case 0: nv = 0; break; case 1: nv = 0xffffffffULL; break;
+                              case 2: nv = 0x7fffffffffffffffULL; break; default: nv = v ^ (1ULL << rng_u(63)); }
+                              mv_wrvar(env, &eo, sizeof env, nv); }
+            else mv_wrvar(env, &eo, sizeof env, v);
+        } else if ((k & 7) == 2) {
+            const unsigned char *vp; size_t vl;
+            if (!mv_rdvar(pl, pn, &i, &l)) break; if (i + l > pn) break;
+            vp = pl + i; vl = (size_t)l; i += vl;
+            mv_wrvar(env, &eo, sizeof env, k);
+            if (fi == pick) { size_t fl = mv_fuzz(fz, sizeof fz); mv_wrvar(env, &eo, sizeof env, fl); mv_wr(env, &eo, sizeof env, fz, fl); }
+            else { mv_wrvar(env, &eo, sizeof env, vl); mv_wr(env, &eo, sizeof env, vp, vl); }
+        } else if ((k & 7) == 5) { mv_wrvar(env, &eo, sizeof env, k); mv_wr(env, &eo, sizeof env, pl + i, 4); i += 4; }
+        else if ((k & 7) == 1) { mv_wrvar(env, &eo, sizeof env, k); mv_wr(env, &eo, sizeof env, pl + i, 8); i += 8; }
+        else break;
+        fi++;
+    }
+    if (eo > sizeof env) return 0;
+    if (kiros) {
+        if (eo + 16 > cap) return 0;
+        out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 8; memcpy(out + 4, "protobuf", 8);
+        out[12] = (unsigned char)(eo >> 24); out[13] = (unsigned char)(eo >> 16);
+        out[14] = (unsigned char)(eo >> 8);  out[15] = (unsigned char)eo;
+        memcpy(out + 16, env, eo); return 16 + eo;
+    }
+    if (eo > cap) return 0; memcpy(out, env, eo); return eo;
+}
+
+static size_t dcerpc_mutate_frame(const unsigned char *in, size_t inlen, unsigned char *out, size_t cap)
+{
+    static unsigned char fz[70000];
+    int le; size_t hdr, stub, fl, total;
+    if (inlen < 16 || inlen > cap) return 0;
+    le = (in[4] >> 4) & 1;
+    hdr = (in[2] == 0 && inlen >= 24) ? 24 : 16;
+    if (hdr > inlen) hdr = 16;
+    stub = inlen - hdr;
+    memcpy(out, in, hdr);
+    if (rng_u(100) < 50 && stub > 0) {
+        unsigned flips, j;
+        if (stub > sizeof fz) stub = sizeof fz; memcpy(fz, in + hdr, stub); fl = stub;
+        flips = 1 + rng_u(16); for (j = 0; j < flips && fl; ++j) fz[rng_u((unsigned)fl)] ^= (unsigned char)(1u << rng_u(8));
+    } else fl = mv_fuzz(fz, sizeof fz);
+    if (hdr + fl > cap) fl = cap - hdr;
+    memcpy(out + hdr, fz, fl);
+    total = hdr + fl;
+    if (le) { out[8] = (unsigned char)(total & 0xff); out[9] = (unsigned char)((total >> 8) & 0xff); }
+    else    { out[8] = (unsigned char)((total >> 8) & 0xff); out[9] = (unsigned char)(total & 0xff); }
+    return total;
+}
+
 static size_t gen_payload(unsigned iter, unsigned maxlen, unsigned char *buf,
                           size_t bufcap, const char **desc, DWORD *lenlie)
 {
@@ -1196,10 +1386,19 @@ static size_t gen_payload(unsigned iter, unsigned maxlen, unsigned char *buf,
 
     if (g_corpus_n > 0 && rng_u(100) < 65) {
         int idx = (int)rng_u((unsigned)g_corpus_n);
-        size_t cl = g_corpus_len[idx];
+        const unsigned char *src = g_corpus[idx];
+        size_t sl = g_corpus_len[idx], cl;
         unsigned flips, k;
+        if (rng_u(100) < 55) {
+            size_t m = 0;
+            if (sl >= 16 && src[0] == 0 && src[1] == 0 && src[2] == 0 && src[3] == 8 && memcmp(src + 4, "protobuf", 8) == 0)
+                { m = pb_mutate_frame(src, sl, buf, bufcap); if (m) { *desc = "proto-field"; return m; } }
+            else if (sl >= 16 && src[0] == 5 && src[1] == 0 && src[2] <= 20)
+                { m = dcerpc_mutate_frame(src, sl, buf, bufcap); if (m) { *desc = "rpc-stub"; return m; } }
+        }
+        cl = sl;
         if (cl > bufcap) cl = bufcap;
-        memcpy(buf, g_corpus[idx], cl);
+        memcpy(buf, src, cl);
         n = cl;
         if (n > 0) {
             flips = 1 + rng_u(16);
@@ -1651,6 +1850,175 @@ static void frame_dissect(FILE *f, const unsigned char *b, size_t n)
     frame_dissect2(f, b, n, 0);
 }
 
+enum payload_fmt { PF_HEX, PF_TEXT, PF_JSON, PF_XML, PF_PROTOBUF, PF_KIROS, PF_DCERPC, PF_DOTNET, PF_ASN1 };
+static int g_force_fmt = -1;
+
+static const char *fmt_name(int f)
+{
+    switch (f) {
+    case PF_KIROS:    return "kiros-protobuf";
+    case PF_PROTOBUF: return "protobuf";
+    case PF_DCERPC:   return "DCE/RPC (MSRPC)";
+    case PF_DOTNET:   return ".NET serialization";
+    case PF_JSON:     return "JSON";
+    case PF_XML:      return "XML";
+    case PF_ASN1:     return "ASN.1/DER";
+    case PF_TEXT:     return "text";
+    default:          return "binary";
+    }
+}
+
+static int parse_fmt(const char *s)
+{
+    if (!s) return -1;
+    if (!_stricmp(s, "auto"))     return -1;
+    if (!_stricmp(s, "protobuf")) return PF_PROTOBUF;
+    if (!_stricmp(s, "kiros"))    return PF_KIROS;
+    if (!_stricmp(s, "dcerpc") || !_stricmp(s, "rpc")) return PF_DCERPC;
+    if (!_stricmp(s, "dotnet") || !_stricmp(s, "net")) return PF_DOTNET;
+    if (!_stricmp(s, "json"))     return PF_JSON;
+    if (!_stricmp(s, "xml"))      return PF_XML;
+    if (!_stricmp(s, "asn1") || !_stricmp(s, "der")) return PF_ASN1;
+    if (!_stricmp(s, "text"))     return PF_TEXT;
+    if (!_stricmp(s, "hex") || !_stricmp(s, "binary")) return PF_HEX;
+    return -1;
+}
+
+static int mostly_printable(const unsigned char *b, size_t n)
+{
+    size_t i, p = 0;
+    if (!n) return 0;
+    for (i = 0; i < n; ++i) { unsigned char c = b[i]; if (c == 9 || c == 10 || c == 13 || (c >= 32 && c < 127)) p++; }
+    return p * 100 >= n * 90;
+}
+
+static int der_len(const unsigned char *b, size_t n, size_t *outlen, int *hl)
+{
+    if (n < 1) return 0;
+    if (b[0] < 0x80) { *outlen = b[0]; *hl = 1; return 1; }
+    { int nb = b[0] & 0x7f, i; size_t v = 0;
+      if (nb == 0 || nb > 4 || (size_t)nb + 1 > n) return 0;
+      for (i = 0; i < nb; ++i) v = (v << 8) | b[1 + i];
+      *outlen = v; *hl = 1 + nb; return 1; }
+}
+
+static int detect_fmt(const unsigned char *b, size_t n)
+{
+    size_t i = 0;
+    if (n == 0) return PF_HEX;
+    if (is_magic_frame(b, n)) return PF_KIROS;
+    if (n >= 16 && b[0] == 5 && b[1] == 0 && b[2] <= 20) return PF_DCERPC;
+    if (n >= 17 && b[0] == 0x00 && b[5] == 0xFF && b[6] == 0xFF && b[7] == 0xFF && b[8] == 0xFF && b[9] == 0x01)
+        return PF_DOTNET;
+    if (n >= 6 && b[0] == 0x00 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x01) return PF_DOTNET;
+    while (i < n && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n')) i++;
+    if (i < n && (b[i] == '{' || b[i] == '[') && mostly_printable(b, n)) return PF_JSON;
+    if (i < n && b[i] == '<' && mostly_printable(b, n)) return PF_XML;
+    if (b[0] == 0x30 || b[0] == 0x31) { size_t l; int hl; if (der_len(b + 1, n - 1, &l, &hl) && (size_t)(1 + hl) + l <= n && l > 0) return PF_ASN1; }
+    if (pb_is_message(b, n)) return PF_PROTOBUF;
+    if (mostly_printable(b, n)) return PF_TEXT;
+    return PF_HEX;
+}
+
+static const char *ptype_name(int t)
+{
+    static const char *nm[] = { "request", "ping", "response", "fault", "working", "nocall",
+        "reject", "ack", "cl_cancel", "fack", "cancel_ack", "bind", "bind_ack", "bind_nak",
+        "alter_context", "alter_context_resp", "shutdown", "co_cancel", "orphaned", "rts" };
+    return (t >= 0 && t < 20) ? nm[t] : "?";
+}
+
+static const struct { const char *uuid; const char *name; } kRpcIf[] = {
+    { "12345778-1234-abcd-ef00-0123456789ab", "samr" },
+    { "12345778-1234-abcd-ef00-0123456789ac", "lsarpc" },
+    { "367abb81-9844-35f1-ad32-98f038001003", "svcctl" },
+    { "12345678-1234-abcd-ef00-0123456789ab", "spoolss (MS-RPRN)" },
+    { "c681d488-d850-11d0-8c52-00c04fd90f7e", "efsrpc (lsarpc)" },
+    { "df1941c5-fe89-4e79-bf10-463657acf44d", "efsrpc (MS-EFSR)" },
+    { "338cd001-2244-31f1-aaaa-900038001003", "winreg" },
+    { "4b324fc8-1670-01d3-1278-5a47bf6ee188", "srvsvc" },
+    { NULL, NULL }
+};
+
+static void uuid_str(const unsigned char *p, int le, char *out)
+{
+    unsigned long d1; unsigned d2, d3;
+    if (le) { d1 = p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned long)p[3] << 24); d2 = p[4] | (p[5] << 8); d3 = p[6] | (p[7] << 8); }
+    else    { d1 = ((unsigned long)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];  d2 = (p[4] << 8) | p[5]; d3 = (p[6] << 8) | p[7]; }
+    sprintf(out, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            d1, d2, d3, p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+}
+
+static void dcerpc_dump(FILE *f, const unsigned char *b, size_t n)
+{
+    int ptype = b[2], le = ((b[4] >> 4) & 1);
+    unsigned frag = le ? (b[8] | (b[9] << 8)) : ((b[8] << 8) | b[9]);
+    unsigned callid = (n >= 16) ? (le ? (b[12] | (b[13] << 8) | (b[14] << 16) | ((unsigned)b[15] << 24))
+                                       : (((unsigned)b[12] << 24) | (b[13] << 16) | (b[14] << 8) | b[15])) : 0;
+    fprintf(f, "  [DCE/RPC] v%u.%u  ptype=%d (%s)  flags=0x%02x  %s-endian  frag_len=%u  call_id=%u\n",
+            b[0], b[1], ptype, ptype_name(ptype), b[3], le ? "little" : "big", frag, callid);
+    if ((ptype == 11 || ptype == 14) && n >= 28 + 4 + 20) {
+        const unsigned char *ab = b + 28 + 4; char u[40]; const char *who = "?"; int k;
+        uuid_str(ab, le, u);
+        for (k = 0; kRpcIf[k].uuid; ++k) if (_stricmp(kRpcIf[k].uuid, u) == 0) { who = kRpcIf[k].name; break; }
+        fprintf(f, "    bind -> interface %s  (%s)  v%u\n", u, who, le ? (ab[16] | (ab[17] << 8)) : ((ab[16] << 8) | ab[17]));
+    } else if (ptype == 0 && n >= 24) {
+        unsigned opnum = le ? (b[22] | (b[23] << 8)) : ((b[22] << 8) | b[23]);
+        fprintf(f, "    request opnum=%u  stub[%zu bytes]\n", opnum, n > 24 ? n - 24 : 0);
+    }
+    fhex_ascii(f, b, n, 192);
+}
+
+static void dotnet_dump(FILE *f, const unsigned char *b, size_t n)
+{
+    fprintf(f, "  [.NET serialization] BinaryFormatter / NetDataContractSerializer / NMF stream.\n");
+    fprintf(f, "      >>> UNSAFE-DESERIALIZATION candidate: if a privileged endpoint deserializes this,\n");
+    fprintf(f, "          it is very likely RCE. Extract the stream and weaponize with ysoserial.net.\n");
+    fhex_ascii(f, b, n, 192);
+}
+
+static void asn1_dump(FILE *f, const unsigned char *b, size_t n, int depth)
+{
+    size_t off = 0; char ind[40]; int di = depth * 2;
+    if (di > 36) di = 36; memset(ind, ' ', (size_t)di); ind[di] = 0;
+    while (off + 2 <= n) {
+        int tag = b[off], cls = (tag >> 6) & 3, cons = (tag >> 5) & 1, num = tag & 0x1f;
+        size_t len, vs; int hl;
+        const char *tn = num == 16 ? "SEQUENCE" : num == 17 ? "SET" : num == 2 ? "INTEGER" :
+                         num == 4 ? "OCTET STRING" : num == 6 ? "OID" : num == 3 ? "BIT STRING" :
+                         num == 5 ? "NULL" : "";
+        if (!der_len(b + off + 1, n - off - 1, &len, &hl)) break;
+        vs = off + 1 + hl;
+        if (vs + len > n) break;
+        fprintf(f, "%s[%s%s tag=%d len=%zu]\n", ind, cls == 2 ? "ctx-" : cls == 1 ? "app-" : "", tn[0] ? tn : "", num, len);
+        if (cons) asn1_dump(f, b + vs, len, depth + 1);
+        else if (len && len <= 48) { size_t i; fprintf(f, "%s  = ", ind); for (i = 0; i < len; ++i) fprintf(f, "%02x", b[vs + i]); fprintf(f, "\n"); }
+        off = vs + len;
+    }
+}
+
+static void text_dump(FILE *f, const unsigned char *b, size_t n)
+{
+    size_t i, lim = n < 4096 ? n : 4096;
+    for (i = 0; i < lim; ++i) { unsigned char c = b[i]; fputc(((c >= 32 && c < 127) || c == 9 || c == 10 || c == 13) ? c : '.', f); }
+    if (n > lim) fprintf(f, "\n  ...(%zu bytes total)", n);
+    fprintf(f, "\n");
+}
+
+static void dissect_auto(FILE *f, const unsigned char *b, size_t n)
+{
+    int fmt = (g_force_fmt != -1) ? g_force_fmt : detect_fmt(b, n);
+    fprintf(f, "  [format: %s]\n", fmt_name(fmt));
+    switch (fmt) {
+    case PF_KIROS: case PF_PROTOBUF: frame_dissect(f, b, n); break;
+    case PF_DCERPC:                  dcerpc_dump(f, b, n);   break;
+    case PF_DOTNET:                  dotnet_dump(f, b, n);   break;
+    case PF_ASN1:                    asn1_dump(f, b, n, 2);  break;
+    case PF_JSON: case PF_XML: case PF_TEXT: text_dump(f, b, n); break;
+    default:                         fhex_ascii(f, b, n, 512); break;
+    }
+}
+
 static int mode_decode(const char *path, int is_corpus, const char *hexstr)
 {
     unsigned char *buf = NULL; size_t len = 0;
@@ -1669,7 +2037,7 @@ static int mode_decode(const char *path, int is_corpus, const char *hexstr)
         }
         len = j;
         printf("[*] decoding %zu bytes from --hex\n", len);
-        frame_dissect(stdout, buf, len);
+        dissect_auto(stdout, buf, len);
         free(buf);
         return 0;
     }
@@ -1686,13 +2054,13 @@ static int mode_decode(const char *path, int is_corpus, const char *hexstr)
             off += 4;
             if (fl > len - off) { printf("  [frame %d truncated: wants %u, have %zu]\n", idx, (unsigned)fl, len - off); break; }
             printf("\n=== frame %d (%u bytes) ===\n", idx++, (unsigned)fl);
-            frame_dissect(stdout, buf + off, fl);
+            dissect_auto(stdout, buf + off, fl);
             off += fl;
         }
         printf("\n[*] %d record(s) decoded.\n", idx);
     } else {
         printf("[*] decoding %s (%zu bytes)\n", path, len);
-        frame_dissect(stdout, buf, len);
+        dissect_auto(stdout, buf, len);
     }
     free(buf);
     return 0;
@@ -1818,7 +2186,7 @@ static int mode_send(const char *name, enum frame_kind fr, int nl,
 
     if (rtot) {
         printf("[*] reply %zu bytes:\n", rtot); dump_hex_ascii(resp, rtot);
-        if (g_decode) { printf("[*] decoded reply:\n"); frame_dissect(stdout, resp, rtot); }
+        if (g_decode) { printf("[*] decoded reply:\n"); dissect_auto(stdout, resp, rtot); }
     }
     else       printf("[*] no reply within %u ms (wrong framing/schema, or one-way topic)\n", readms);
 
@@ -1840,7 +2208,7 @@ static void relay_session(HANDLE cli, HANDLE up, FILE *log, FILE *corpus,
                 fprintf(log, "C2S %lu: ", (unsigned long)rd);
                 hexdump_line(log, buf, rd, 64);
                 fprintf(log, "\n");
-                if (g_decode) { fprintf(log, "  [C2S decode]\n"); frame_dissect(log, buf, rd); }
+                if (g_decode) { fprintf(log, "  [C2S decode]\n"); dissect_auto(log, buf, rd); }
                 if (corpus) {
                     uint32_t l = (uint32_t)rd;
                     fwrite(&l, 4, 1, corpus);
@@ -1859,7 +2227,7 @@ static void relay_session(HANDLE cli, HANDLE up, FILE *log, FILE *corpus,
                 fprintf(log, "S2C %lu: ", (unsigned long)rd);
                 hexdump_line(log, buf, rd, 64);
                 fprintf(log, "\n");
-                if (g_decode) { fprintf(log, "  [S2C decode]\n"); frame_dissect(log, buf, rd); }
+                if (g_decode) { fprintf(log, "  [S2C decode]\n"); dissect_auto(log, buf, rd); }
                 if (!WriteFile(cli, buf, rd, &wr, NULL)) break;
                 did = 1;
             } else break;
@@ -2076,7 +2444,7 @@ static void banner(void)
         "  ____ _ ____ ____ ____ ____ _  _\n"
         "  |___ | |___ |  | |___ |  |  \\/ \n"
         "  |    | |    |__| |    |__| _/\\_%s\n"
-        "  %sFIFOFox v%s  - Windows named-pipe security auditor and fuzzer\n"
+        "  %sFIFOFox v%s - Windows named-pipe security auditor and fuzzer\n"
         "  Zero Science Lab - https://zeroscience.mk - @zeroscience%s\n\n",
         CC(A_MAG), CC(A_RESET), CC(A_GRY), FIFOFOX_VERSION, CC(A_RESET));
 }
@@ -2086,6 +2454,7 @@ static void usage(const char *argv0)
     printf(
         "Usage:\n"
         "  %s enum    [--all] [--squat] [--html <file>]\n"
+        "  %s listeners [--all]   (loopback/wildcard TCP IPC endpoints + owner/privilege)\n"
         "  %s audit   <pipe> [--html <file>]\n"
         "  %s capture <pipe> --authorized [--count N]\n"
         "  %s fuzz    <pipe> --authorized [options]\n"
@@ -2102,7 +2471,10 @@ static void usage(const char *argv0)
         "      --no-color  disable ANSI color\n"
         "      --no-banner suppress the startup banner\n"
         "      --no-decode (alias --raw) print raw hex only; skip protobuf dissection\n"
-        "      --no-service  audit: skip the owning-service / unquoted-path / dir-ACL check\n\n"
+        "      --no-service  audit: skip the owning-service / unquoted-path / dir-ACL check\n"
+        "      --peek        audit: passively read any unsolicited server data and detect its format\n"
+        "      --format <f>  force the payload dissector for decode/send/capture:\n"
+        "                    auto (default) | protobuf | dcerpc | dotnet | json | xml | asn1 | text | hex\n\n"
         "enum options:\n"
         "  --all           include readable OK pipes and unreadable ones, not just flagged\n"
         "  --squat         active probe: also flag squattable pipes as DANGER\n"
@@ -2113,7 +2485,8 @@ static void usage(const char *argv0)
         "fuzz options:\n"
         "  --frame  raw|len16le|len16be|len32le|len32be|cmd   (default raw)\n"
         "  --cmd    <prefix>   command prefix for --frame cmd   (default \"3 \")\n"
-        "  --corpus <file>     seed mutations from a capture corpus (structure-aware)\n"
+        "  --corpus <file>     seed mutations from a capture corpus; format-aware (keeps\n"
+        "                      protobuf/DCE-RPC frames valid and fuzzes the inner fields/stub)\n"
         "  --iters  <N>        number of test cases             (default 500)\n"
         "  --seed   <hex|dec>  PRNG seed for reproducible runs  (default fixed)\n"
         "  --maxlen <N>        max random payload length        (default 4096)\n"
@@ -2125,8 +2498,10 @@ static void usage(const char *argv0)
         "  --read <ms>         wait this long for a reply        (default 1500)\n"
         "  (replies are auto-dissected: framing + protobuf field tree; --raw to disable)\n\n"
         "decode: offline protocol dissection of captured bytes (no connection).\n"
-        "  recognizes  u32be(8)[\"protobuf\"]u32be(len)[body], bare u32 length prefixes,\n"
-        "  and raw protobuf; prints field numbers, strings, nested msgs and Any{}.\n"
+        "  AUTO-DETECTS the payload format and routes to the right dissector:\n"
+        "    protobuf/kiros (field tree + Any{}), DCE/RPC (header + interface UUID + opnum),\n"
+        "    .NET serialization (flagged as unsafe-deserialization candidate), JSON, XML,\n"
+        "    ASN.1/DER, text, or hex. Override with --format <f>.\n"
         "  <file>          a single captured frame (e.g. trigger_reinstall.bin)\n"
         "  --corpus        <file> is a capture corpus ([u32le len][frame] records)\n"
         "  --hex <bytes>   decode an inline hex string instead of a file\n\n"
@@ -2149,7 +2524,7 @@ static void usage(const char *argv0)
         "  %s send logitech_kiros_agent-<id> --authorized --kiros --path /updates/depot/info \\\n"
         "       --type type.googleapis.com/logi.protocol.updates.Depot.Info --arg logioptionsplus\n",
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int has_flag(int argc, char **argv, const char *flag)
@@ -2164,6 +2539,143 @@ static const char *opt_val(int argc, char **argv, const char *flag, const char *
     int i;
     for (i = 2; i < argc - 1; ++i) if (!strcmp(argv[i], flag)) return argv[i + 1];
     return def;
+}
+
+#pragma comment(lib, "iphlpapi.lib")
+typedef struct { DWORD st, la, lp, ra, rp, pid; } FFX_TCPROW;
+typedef struct { DWORD n; FFX_TCPROW t[1]; }       FFX_TCPTBL;
+typedef struct { UCHAR la[16]; DWORD lsid, lp; UCHAR ra[16]; DWORD rsid, rp, st, pid; } FFX_TCP6ROW;
+typedef struct { DWORD n; FFX_TCP6ROW t[1]; }      FFX_TCP6TBL;
+DWORD WINAPI GetExtendedTcpTable(PVOID, PDWORD, BOOL, ULONG, int, ULONG);
+#define FFX_LISTENER_CLASS 3
+#define FFX_STATE_LISTEN   2
+
+static int ci_contains(const char *hay, const char *needle)
+{
+    size_t hl = strlen(hay), nl = strlen(needle), i, j;
+    if (nl == 0) return 1; if (nl > hl) return 0;
+    for (i = 0; i + nl <= hl; ++i) { int ok = 1;
+        for (j = 0; j < nl; ++j) { char a = hay[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a += 32; if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) { ok = 0; break; } }
+        if (ok) return 1; }
+    return 0;
+}
+
+static void pid_name(DWORD pid, char *out, size_t cap)
+{
+    HANDLE s; PROCESSENTRY32 pe; pe.dwSize = sizeof pe;
+    snprintf(out, cap, "(pid %lu)", (unsigned long)pid);
+    s = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (s == INVALID_HANDLE_VALUE) return;
+    if (Process32First(s, &pe)) do { if (pe.th32ProcessID == pid) { snprintf(out, cap, "%s", pe.szExeFile); break; } }
+        while (Process32Next(s, &pe));
+    CloseHandle(s);
+}
+
+static void proc_owner(DWORD pid, char *out, size_t cap)
+{
+    char svc[256], disp[256], image[1024], acct[256]; int shared; HANDLE p, tok;
+    out[0] = 0;
+    if (svc_find_by_pid(pid, svc, sizeof svc, disp, sizeof disp, &shared)
+        && svc_query_config(svc, image, sizeof image, acct, sizeof acct) && acct[0]) {
+        snprintf(out, cap, "%s [svc:%s]", acct, svc); return;
+    }
+    p = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!p) p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (p) {
+        if (OpenProcessToken(p, TOKEN_QUERY, &tok)) {
+            DWORD len = 0; GetTokenInformation(tok, TokenUser, NULL, 0, &len);
+            if (len) { TOKEN_USER *tu = (TOKEN_USER *)malloc(len);
+                if (tu && GetTokenInformation(tok, TokenUser, tu, len, &len)) {
+                    char nm[256], dm[256]; DWORD nl = sizeof nm, dl = sizeof dm; SID_NAME_USE use;
+                    if (LookupAccountSidA(NULL, tu->User.Sid, nm, &nl, dm, &dl, &use)) snprintf(out, cap, "%s\\%s", dm, nm);
+                    else { char *ss = NULL; if (ConvertSidToStringSidA(tu->User.Sid, &ss)) { snprintf(out, cap, "%s", ss); LocalFree(ss); } }
+                }
+                free(tu); }
+            CloseHandle(tok);
+        }
+        CloseHandle(p);
+    }
+    if (!out[0]) snprintf(out, cap, "(owner not resolvable - higher IL)");
+}
+
+static int listener_grade(const char *owner)
+{
+    if (ci_contains(owner, "system")) return 2;
+    if (ci_contains(owner, "local service") || ci_contains(owner, "network service") ||
+        ci_contains(owner, "localservice") || ci_contains(owner, "networkservice")) return 1;
+    return 0;
+}
+
+static void listener_row(const char *endpoint, const char *scope, DWORD pid,
+                         int *danger, int *warn, int *okc)
+{
+    char pname[MAX_PATH] = "", owner[400] = ""; int g; const char *sev;
+    pid_name(pid, pname, sizeof pname);
+    proc_owner(pid, owner, sizeof owner);
+    g = listener_grade(owner);
+    if (g >= 2) (*danger)++; else if (g == 1) (*warn)++; else (*okc)++;
+    sev = g >= 2 ? "DANGER" : (g == 1 ? " WARN " : "  ok  ");
+    printf("[%s%s%s] %s%-22s%s %s(%s)%s  %sPID %-6lu%s %-26s  owner: %s%s%s\n",
+           CC(sev_ansi(g)), sev, CC(A_RESET), CC(A_BOLD), endpoint, CC(A_RESET),
+           CC(A_GRY), scope, CC(A_RESET), CC(A_GRY), (unsigned long)pid, CC(A_RESET),
+           pname, CC(g >= 2 ? A_RED : A_RESET), owner, CC(A_RESET));
+}
+
+static int mode_listeners(int show_all)
+{
+    DWORD sz = 0, i; int danger = 0, warn = 0, okc = 0, total = 0;
+    printf("[*] Enumerating local TCP listeners ...\n\n");
+
+    GetExtendedTcpTable(NULL, &sz, FALSE, 2, FFX_LISTENER_CLASS, 0);
+    if (sz) {
+        FFX_TCPTBL *t = (FFX_TCPTBL *)malloc(sz);
+        if (t && GetExtendedTcpTable(t, &sz, FALSE, 2, FFX_LISTENER_CLASS, 0) == 0) {
+            for (i = 0; i < t->n; ++i) {
+                DWORD a = t->t[i].la; unsigned port; char ep[48]; int loop, wild;
+                if (t->t[i].st != FFX_STATE_LISTEN) continue;
+                loop = (a == 0x0100007F); wild = (a == 0);
+                if (!loop && !wild && !show_all) continue;
+                total++;
+                port = ((t->t[i].lp & 0xff) << 8) | ((t->t[i].lp >> 8) & 0xff);
+                snprintf(ep, sizeof ep, "%lu.%lu.%lu.%lu:%u",
+                         (unsigned long)(a & 0xff), (unsigned long)((a >> 8) & 0xff),
+                         (unsigned long)((a >> 16) & 0xff), (unsigned long)((a >> 24) & 0xff), port);
+                listener_row(ep, loop ? "loopback" : (wild ? "all-ifaces" : "iface"), t->t[i].pid, &danger, &warn, &okc);
+            }
+        }
+        free(t);
+    }
+
+    sz = 0; GetExtendedTcpTable(NULL, &sz, FALSE, 23, FFX_LISTENER_CLASS, 0);
+    if (sz) {
+        FFX_TCP6TBL *t = (FFX_TCP6TBL *)malloc(sz);
+        if (t && GetExtendedTcpTable(t, &sz, FALSE, 23, FFX_LISTENER_CLASS, 0) == 0) {
+            for (i = 0; i < t->n; ++i) {
+                const UCHAR *a = t->t[i].la; unsigned port; char ep[48]; int j, zero = 1, loop, wild;
+                if (t->t[i].st != FFX_STATE_LISTEN) continue;
+                for (j = 0; j < 15; ++j) if (a[j]) { zero = 0; break; }
+                loop = (zero && a[15] == 1); wild = (zero && a[15] == 0);
+                if (!loop && !wild && !show_all) continue;
+                total++;
+                port = ((t->t[i].lp & 0xff) << 8) | ((t->t[i].lp >> 8) & 0xff);
+                snprintf(ep, sizeof ep, "[%s]:%u", loop ? "::1" : (wild ? "::" : "v6"), port);
+                listener_row(ep, loop ? "loopback" : (wild ? "all-ifaces" : "iface"), t->t[i].pid, &danger, &warn, &okc);
+            }
+        }
+        free(t);
+    }
+
+    printf("\n------------------------------------------------------------\n");
+    printf("[*] %d listener(s): %s%d danger%s, %s%d warn%s, %s%d ok%s%s\n", total,
+           CC(A_RED), danger, CC(A_RESET), CC(A_YEL), warn, CC(A_RESET),
+           CC(A_GRN), okc, CC(A_RESET), show_all ? "" : "  (loopback/wildcard only; --all for every interface)");
+    print_legend();
+    printf("    Note: ANY local user can connect to a loopback/wildcard listener - TCP has no\n");
+    printf("    DACL. The risk is the OWNER's privilege: a SYSTEM-owned listener is a privileged\n");
+    printf("    local-IPC endpoint (the auto-updater surface). Probe its protocol with a client.\n");
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -2181,6 +2693,8 @@ int main(int argc, char **argv)
             else if (!strcmp(argv[i], "--no-banner")) no_banner = 1;
             else if (!strcmp(argv[i], "--no-decode") || !strcmp(argv[i], "--raw")) g_decode = 0;
             else if (!strcmp(argv[i], "--no-service")) g_no_service = 1;
+            else if (!strcmp(argv[i], "--peek")) g_peek = 1;
+            else if (!strcmp(argv[i], "--format") && i + 1 < argc) g_force_fmt = parse_fmt(argv[i + 1]);
         }
         enable_color(color_want);
     }
@@ -2202,6 +2716,9 @@ int main(int argc, char **argv)
         return mode_enum(has_flag(argc, argv, "--all"),
                          has_flag(argc, argv, "--squat"),
                          opt_val(argc, argv, "--html", NULL));
+
+    if (!strcmp(argv[1], "listeners") || !strcmp(argv[1], "tcp"))
+        return mode_listeners(has_flag(argc, argv, "--all"));
 
     if (!strcmp(argv[1], "audit")) {
         if (argc < 3) { usage(argv[0]); return 1; }
@@ -2229,8 +2746,13 @@ int main(int argc, char **argv)
             const char *corpusf = opt_val(argc, argv, "--corpus", NULL);
             if (corpusf) {
                 int n = load_corpus(corpusf);
-                if (n > 0) printf("[*] Loaded %d corpus frames from %s (structure-aware mode)\n",
-                                  n, corpusf);
+                if (n > 0) {
+                    printf("[*] Loaded %d corpus frames from %s (structure-aware mode)\n", n, corpusf);
+                    if (g_corpus_n > 0)
+                        printf("[*] corpus payload format (frame 0): %s%s\n",
+                               fmt_name(detect_fmt(g_corpus[0], g_corpus_len[0])),
+                               g_force_fmt != -1 ? " (overridden by --format)" : "");
+                }
                 else fprintf(stderr, "[!] --corpus %s: no records loaded, falling back to blind fuzzing\n",
                              corpusf);
             }
