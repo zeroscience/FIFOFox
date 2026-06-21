@@ -1,39 +1,65 @@
 /*
  * fifofox.c  -  Windows named-pipe security auditor and fuzzer
  * ----------------------------------------------------------------------------
- * Warning: The fuzz/squat modes can crash services and the squat+impersonate
- * path is exactly the behavior EDR rules (e.g. Elastic "Privilege Escalation
- * via Named Pipe Impersonation") flag.
+ * FIFOFox is a single-file, zero-dependency Windows named-pipe security
+ * toolkit. One small .exe takes you from recon (enumerate and grade every
+ * pipe's DACL on the box) through deep auditing of a single endpoint, live
+ * interception, and fuzzing, all the way to protocol reverse-engineering
+ * (craft / send / decode of length-prefixed protobuf IPC). It also maps the
+ * loopback TCP IPC surface - the "other half" of local IPC. Standard-user tool
+ * first: the most interesting view of a pipe's attack surface is the one a
+ * low-privileged process sees.
  *
  * Modes
  *   enum                         List every \\.\pipe\ object, decode its DACL
  *                                to SDDL, and GRADE it (flags low-priv writers
- *                                / object-takeover ACEs / NULL DACLs).
+ *                                / object-takeover ACEs / NULL DACLs); shows the
+ *                                pipe owner. Optional --html report.
+ *   listeners                    Enumerate loopback / wildcard TCP IPC endpoints
+ *                                with owning process, account, and privilege -
+ *                                the other half of local IPC (a socket has no
+ *                                DACL, so any local user can connect).
  *   audit  <pipe>                Deep single-pipe report: GetNamedPipeInfo
- *                                flags, server/client PID + image path, SDDL,
- *                                ACE-by-ACE grading, and a live squattability
- *                                test (FILE_FLAG_FIRST_PIPE_INSTANCE).
+ *                                flags, server/client PID + image path, owner,
+ *                                SDDL, ACE-by-ACE grading, a live squattability
+ *                                test (FILE_FLAG_FIRST_PIPE_INSTANCE), the
+ *                                owning-service escalation surface (unquoted
+ *                                path / writable dir / privileged account) and
+ *                                a trust-predicate linter (CWE-347 leads).
+ *   capture <pipe> --authorized  Interception (MITM) relay: stand up a competing
+ *                                instance, relay both directions, log the
+ *                                traffic, and bank a fuzz corpus.
  *   fuzz   <pipe> --authorized   Connect as a client and send mutated frames
  *                                (raw / length-prefixed / command-prefixed),
- *                                with liveness/crash detection and repro logs.
+ *                                format-aware from a corpus, with liveness /
+ *                                crash detection and repro logs.
  *   squat  <pipe> --authorized   Defensive PoC: claim the pipe name first and
  *               [--impersonate]   optionally ImpersonateNamedPipeClient() to
  *                                demonstrate the squat->impersonation risk.
+ *   send   <pipe> --authorized   Deliver one message (raw / framed, or a crafted
+ *                                "kiros" protobuf frame) and decode the reply.
+ *   craft                        Build a Logitech "kiros" protobuf request frame
+ *                                from flags (offline; no connection made).
+ *   decode <file>                Offline multi-format dissector (protobuf / kiros
+ *                                / DCE-RPC / .NET / JSON / XML / ASN.1) over a
+ *                                file, a --corpus dir, or raw --hex bytes.
  *
  * <pipe> may be a bare name ("cowork-vm-service") or a full "\\.\pipe\name".
  *
  * Build (MSVC):   cl /W3 /O2 /D_CRT_SECURE_NO_WARNINGS fifofox.c
- * Build (MinGW):  gcc -O2 -Wall -o fifofox.exe fifofox.c -ladvapi32
+ * Build (MinGW):  gcc -O2 -Wall -o fifofox.exe fifofox.c -ladvapi32 -liphlpapi
  *
- * Does NOT require administrator rights: enum/audit/fuzz/capture/squat all run
- * as a standard user against pipes whose DACL grants the caller access (which
- * is exactly the low-priv attack surface you want to assess). Admin only adds
- * visibility (resolving other-user/SYSTEM server image paths, reading
+ * Does NOT require administrator rights: enum / listeners / audit / fuzz /
+ * capture / squat / send all run as a standard user against endpoints the
+ * caller can already reach (which is exactly the low-priv attack surface you
+ * want to assess); craft / decode are fully offline. Admin only adds
+ * visibility (resolving other-user / SYSTEM server image paths, reading
  * restrictive SDs); a service context with SeImpersonatePrivilege is needed
- * only to *weaponize* squat+impersonate into SYSTEM. See the manual.
+ * only to *weaponize* squat+impersonate into SYSTEM. See fifofox-readme-current.md.
  *
- * Dependencies: advapi32 (SDDL/ACL/SID/token), kernel32 (pipe APIs). No others.
- * 
+ * Dependencies: advapi32 (SDDL/ACL/SID/token), kernel32 (pipe APIs),
+ * iphlpapi (TCP table for listeners). No others; linked via #pragma under MSVC.
+ *
  * lqwrm (c) 2026
  * ----------------------------------------------------------------------------
  */
@@ -43,17 +69,17 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 
-#include <tlhelp32.h>//
-#include <windows.h>///
-#include <stdlib.h>////
-#include <string.h>////
-#include <stdint.h>////
-#include <aclapi.h>////
-#include <winsvc.h>////
-#include <stdarg.h>////
-#include <stdio.h>/////
-#include <sddl.h>//////
-#include <time.h>//////
+#include <windows.h>////
+#include <tlhelp32.h>///
+#include <stdlib.h>/////
+#include <string.h>/////
+#include <stdint.h>/////
+#include <aclapi.h>/////
+#include <winsvc.h>/////
+#include <stdarg.h>/////
+#include <stdio.h>//////
+#include <sddl.h>///////
+#include <time.h>///////
 
 #define FIFOFOX_VERSION "1.2.3 (ilegnisi)"
 
