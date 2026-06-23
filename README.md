@@ -35,7 +35,7 @@ visibility; a service context is needed only to *weaponize* impersonation.
 
 > The `decode` and `craft` protocol tooling in this build grew directly out of a
 > live named-pipe research engagement against a LocalSystem updater IPC. See the
-> companion Zero Science Lab write-up.
+> companion Zero Science Lab write-up - https://www.zeroscience.mk/#/lablog/named-pipes-a-signature-gate-and-a-dead-end-lpe
 
 ---
 
